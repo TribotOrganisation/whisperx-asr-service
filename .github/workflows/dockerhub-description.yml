@@ -1,0 +1,26 @@
+name: Sync Docker Hub Description
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - DOCKERHUB.md
+      - .github/workflows/dockerhub-description.yml
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/whisperx-asr-service
+          short-description: "WhisperX ASR API Service - Speech Recognition with Speaker Diarization"
+          readme-filepath: ./DOCKERHUB.md
