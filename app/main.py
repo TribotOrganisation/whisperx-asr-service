@@ -26,6 +26,7 @@ from app.pipeline import (
     format_timestamp,
     sanitize_float_values,
     run_pipeline,
+    resolve_model_name,
     _whisper_models as loaded_models,
 )
 from app.queue import run_in_queue, get_queue_metrics
@@ -122,6 +123,11 @@ async def transcribe_audio(
         # Handle legacy parameter names
         if output is not None:
             output_format = output
+
+        # Map OpenAI-style aliases (whisper-tiny, whisper-large-v3, whisper-1, ...)
+        # to canonical faster-whisper names so /asr accepts the same identifiers
+        # advertised by /v1/models.
+        model = resolve_model_name(model)
 
         # Resolve diarization toggle
         if diarize is not None or enable_diarization is not None:

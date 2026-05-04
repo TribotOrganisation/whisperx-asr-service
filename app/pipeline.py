@@ -35,6 +35,65 @@ HF_TOKEN = os.getenv("HF_TOKEN", None)
 CACHE_DIR = os.getenv("CACHE_DIR", "/.cache")
 DEFAULT_MODEL = os.getenv("PRELOAD_MODEL", "large-v3")
 
+
+def get_canonical_models() -> list:
+    """
+    Canonical model names accepted by the underlying faster-whisper engine.
+
+    Sourced from faster_whisper.available_models() so this list stays in sync
+    with whatever version of faster-whisper is installed, instead of being
+    hardcoded here.
+    """
+    try:
+        from faster_whisper import available_models
+        return list(available_models())
+    except Exception:
+        # Defensive fallback if the import surface ever changes upstream.
+        return [
+            "tiny.en", "tiny", "base.en", "base", "small.en", "small",
+            "medium.en", "medium", "large-v1", "large-v2", "large-v3", "large",
+            "distil-large-v2", "distil-medium.en", "distil-small.en",
+            "distil-large-v3", "distil-large-v3.5", "large-v3-turbo", "turbo",
+        ]
+
+
+# OpenAI-style aliases → canonical faster-whisper names. These are kept for
+# backwards compatibility on the request path; new clients should use the
+# canonical names returned by /v1/models.
+_MODEL_ALIASES = {
+    "whisper-1": os.getenv("OPENAI_WHISPER1_MODEL", DEFAULT_MODEL),
+    "whisper-large-v3": "large-v3",
+    "whisper-large-v2": "large-v2",
+    "whisper-medium": "medium",
+    "whisper-small": "small",
+    "whisper-base": "base",
+    "whisper-tiny": "tiny",
+}
+
+
+def resolve_model_name(model: str) -> str:
+    """
+    Resolve a user-supplied model identifier to a canonical faster-whisper name.
+
+    Accepts canonical names (tiny, large-v3, distil-medium.en, ...) as-is and
+    maps OpenAI-style aliases (whisper-tiny, whisper-large-v3, ...) to their
+    canonical equivalents. Unknown values are returned unchanged so the engine
+    can produce its own validation error.
+    """
+    if not model:
+        return DEFAULT_MODEL
+    canonical = set(get_canonical_models())
+    if model in canonical:
+        return model
+    if model in _MODEL_ALIASES:
+        return _MODEL_ALIASES[model]
+    if model.startswith("whisper-"):
+        stripped = model[len("whisper-"):]
+        if stripped in canonical:
+            return stripped
+    return model
+
+
 _model_load_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------

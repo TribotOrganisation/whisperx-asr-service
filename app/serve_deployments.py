@@ -32,6 +32,29 @@ from app.pipeline import (
     HF_TOKEN,
 )
 
+def _attach_serve_handlers_to_app_logger():
+    """
+    Make `app.*` log records visible in Ray Serve's per-replica log file.
+
+    Ray Serve configures only the `ray.serve` logger and disables propagation,
+    so any log emitted by `app.pipeline`, `app.serve_deployments`, etc. inside
+    a deployment worker has no handler attached and is silently dropped.
+    Copying the active handlers from `ray.serve` onto the `app` logger fixes
+    this without changing where Ray writes its own logs.
+
+    Call this from each deployment's __init__ -- by then Ray Serve has already
+    configured the `ray.serve` logger for this replica.
+    """
+    serve_logger = logging.getLogger("ray.serve")
+    app_logger = logging.getLogger("app")
+    if app_logger.handlers:
+        return
+    for h in serve_logger.handlers:
+        app_logger.addHandler(h)
+    app_logger.setLevel(logging.INFO)
+    app_logger.propagate = False
+
+
 logger = logging.getLogger(__name__)
 
 # Batch configuration from env
@@ -75,6 +98,7 @@ class FullPipelineDeployment:
     """
 
     def __init__(self):
+        _attach_serve_handlers_to_app_logger()
         self._ready = False
 
         # Log which GPU this replica landed on
@@ -147,6 +171,7 @@ class WhisperDeployment:
     """Stage 1: Transcription via WhisperX."""
 
     def __init__(self):
+        _attach_serve_handlers_to_app_logger()
         self._ready = False
         if torch.cuda.is_available():
             gpu_id = torch.cuda.current_device()
@@ -237,6 +262,7 @@ class DiarizeDeployment:
     """Stage 3: Pyannote speaker diarization."""
 
     def __init__(self):
+        _attach_serve_handlers_to_app_logger()
         self._ready = False
         if torch.cuda.is_available():
             gpu_id = torch.cuda.current_device()
