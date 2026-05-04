@@ -1,6 +1,6 @@
 # WhisperX ASR API Service
 
-[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](https://github.com/murtaza-nasir/whisperx-asr-service/releases/tag/v0.3.1)
+[![Version](https://img.shields.io/badge/version-0.3.2-blue.svg)](https://github.com/murtaza-nasir/whisperx-asr-service/releases/tag/v0.3.2)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Docker Build](https://github.com/murtaza-nasir/whisperx-asr-service/actions/workflows/docker-publish.yml/badge.svg)](https://github.com/murtaza-nasir/whisperx-asr-service/actions/workflows/docker-publish.yml)
 [![Docker Pulls](https://img.shields.io/docker/pulls/learnedmachine/whisperx-asr-service)](https://hub.docker.com/r/learnedmachine/whisperx-asr-service)
@@ -73,6 +73,27 @@ GPU memory requirements vary by model size:
 - **Docker** and **Docker Compose**
 - **NVIDIA Docker Runtime** (for GPU support)
 - **Hugging Face Account** (for speaker diarization models)
+
+## Image Variants
+
+Two prebuilt Docker images are published per release. They differ only in the
+PyTorch wheel they ship; the application code is identical.
+
+| Tag | PyTorch | CUDA wheels | Supported GPUs |
+|-----|---------|-------------|----------------|
+| `:latest`, `:vX.Y.Z` | 2.7.1 | cu121 | Pascal (10xx) through Hopper. Compatible with the broadest GPU range. |
+| `:blackwell`, `:vX.Y.Z-blackwell` | 2.8.0 | cu128 | Blackwell (RTX 50xx). Drops Pascal/Maxwell support per the PyTorch 2.8 cuDNN/CUDA 12.8 build. |
+
+If you have an RTX 50xx, use the `-blackwell` tag. Everyone else: use `:latest`.
+
+To build a custom variant locally, override the build args:
+
+```bash
+docker build \
+  --build-arg TORCH_VERSION=2.7.1 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 \
+  -t whisperx-asr-service:custom .
+```
 
 ## Quick Start (Prebuilt Image)
 
@@ -411,8 +432,9 @@ DEVICE=cuda              # cuda for GPU, cpu for CPU-only
 # Computation precision
 COMPUTE_TYPE=float16     # float16 (GPU), float32 (CPU), int8 (faster, lower quality)
 
-# Batch size (higher = faster but more memory)
-BATCH_SIZE=16           # 16 for 8GB VRAM, 32+ for high-end GPUs
+# Batch size (higher = faster but more memory). Default is device-aware:
+# 16 on cuda, 2 on cpu. Long audio on CPU benefits from BATCH_SIZE=1.
+BATCH_SIZE=16           # 16 for 8GB VRAM, 32+ for high-end GPUs, 1-2 on CPU
 
 # Hugging Face token for diarization
 HF_TOKEN=hf_xxx...
@@ -422,6 +444,12 @@ PRELOAD_MODEL=large-v3   # Leave empty to disable, or set to: tiny, base, small,
 
 # Maximum file size in MB (prevents out-of-memory errors)
 MAX_FILE_SIZE_MB=1000    # Default 1GB, adjust lower for GPUs with <16GB VRAM
+
+# Idle model eviction (default disabled). When > 0, Whisper models that have
+# not served a request in this many seconds are unloaded from memory by a
+# background sweep. The next request that needs the model will reload it.
+MODEL_KEEP_ALIVE_SECONDS=0          # 0 disables eviction; e.g. 3600 = 1 hour
+MODEL_EVICTION_INTERVAL_SECONDS=60  # Sweep frequency (floor of 30 seconds)
 ```
 
 ### Serve Mode
@@ -632,13 +660,40 @@ curl http://localhost:9000/health
 }
 ```
 
-### Metrics Endpoint
+### Prometheus Metrics
+
+`GET /metrics` returns OpenMetrics text format suitable for a Prometheus
+scrape config:
 
 ```bash
 curl http://localhost:9000/metrics
+# # HELP whisperx_requests_total Total HTTP requests by endpoint and status
+# # TYPE whisperx_requests_total counter
+# whisperx_requests_total{endpoint="/asr",status="ok"} 12.0
+# whisperx_request_duration_seconds_bucket{endpoint="/asr",le="60.0"} 11.0
+# ...
 ```
 
-In simple mode this returns queue depth and in-flight request counts. In Ray mode it returns loaded model info (use the Ray Dashboard at port 8265 for detailed per-deployment metrics).
+| Metric | Type | Notes |
+|--------|------|-------|
+| `whisperx_requests_total{endpoint,status}` | Counter | `status` is `ok`, `http_<code>`, or `error` |
+| `whisperx_request_duration_seconds{endpoint}` | Histogram | End-to-end handler time |
+| `whisperx_active_transcriptions` | Gauge | In-flight `/asr` requests |
+| `whisperx_loaded_models` | Gauge | Whisper models currently in cache |
+| `whisperx_model_evictions_total{model}` | Counter | Models unloaded by the idle-eviction sweep |
+| `whisperx_audio_duration_seconds` | Histogram | Submitted audio duration |
+| `whisperx_audio_size_megabytes` | Histogram | Submitted file size |
+| `whisperx_vram_allocated_bytes` | Gauge | CUDA `memory_allocated()` (0 on CPU) |
+| `whisperx_service_info` | Info | Static labels: version, device, compute_type, serve_mode |
+
+**Ray Serve caveat:** `/metrics` is served by the ingress process. Whisper
+models load inside replica processes, so `whisperx_loaded_models` and
+`whisperx_vram_allocated_bytes` will read 0 in Ray Serve mode. HTTP-level
+metrics (request counts, durations, audio sizes) are accurate. Use the Ray
+Dashboard at port 8265 for per-replica state.
+
+The legacy JSON shape (queue/loaded model state) is still available at
+`GET /queue-metrics` for callers that depended on it.
 
 ### Performance Monitoring
 
@@ -898,6 +953,15 @@ For issues and questions:
 - **Docker WhisperX:** [jim60105/docker-whisperX](https://github.com/jim60105/docker-whisperX)
 
 ## Changelog
+
+### v0.3.2 (2026-05-03)
+- **Pascal/Blackwell image variants (#15):** `:latest` ships PyTorch 2.7.1 (cu121, supports Pascal through Hopper). New `:blackwell` tag ships PyTorch 2.8.0 (cu128) for RTX 50xx. The `Dockerfile` now exposes `TORCH_VERSION` and `TORCH_INDEX_URL` build args and re-pins torch after the WhisperX install so the requested version sticks.
+- **Device-aware `BATCH_SIZE` default (#12):** the default is now 16 on cuda and 2 on cpu. Long CPU runs no longer OOM-kill (exit 137) under the previous 16 default.
+- **Idle model eviction (#16):** new `MODEL_KEEP_ALIVE_SECONDS` env var (default 0/disabled) unloads Whisper models that have been idle longer than the configured window. `MODEL_EVICTION_INTERVAL_SECONDS` controls sweep frequency (floor 30s).
+- **Real Prometheus `/metrics` (#13):** `/metrics` now returns OpenMetrics text instead of JSON. New histograms and counters cover request duration, status, audio duration/size, in-flight requests, loaded model count, model evictions, and VRAM. The previous JSON shape is preserved at `/queue-metrics`.
+- `/asr` accepts the OpenAI-style aliases advertised by `/v1/models` (`whisper-1`, `whisper-tiny`, `whisper-large-v3`, ...).
+- `/v1/models` is sourced from `faster_whisper.available_models()` instead of a hardcoded list.
+- `app.*` log records from Ray Serve replicas now flow into the per-replica log file.
 
 ### v0.3.0 (2026-02-28)
 - Thread-safe model loading with double-checked locking for concurrent request safety

@@ -125,6 +125,31 @@ COMPUTE_TYPE=float16
 BATCH_SIZE=16
 ```
 
+### Step 3.5: Pick the Right Image Variant
+
+Two prebuilt Docker images are published per release. They use the same code
+but ship different PyTorch wheels:
+
+| Tag | PyTorch | Supported GPUs |
+|-----|---------|----------------|
+| `:latest` (`learnedmachine/whisperx-asr-service:latest`) | 2.7.1 / cu121 | Pascal (10xx) through Hopper |
+| `:blackwell` (`learnedmachine/whisperx-asr-service:blackwell`) | 2.8.0 / cu128 | Blackwell (RTX 50xx) |
+
+If you have an RTX 50xx, switch the `image:` line in `docker-compose.yml` to
+the `-blackwell` tag. Everyone else can stick with `:latest`. Pascal users
+specifically need `:latest`; PyTorch 2.8 dropped Pascal support and the
+Blackwell image will fail with `CUDA error: no kernel image is available
+for execution on the device`.
+
+If you build from source, override the build args:
+
+```bash
+docker build \
+  --build-arg TORCH_VERSION=2.7.1 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121 \
+  -t whisperx-asr-service:custom .
+```
+
 ### Step 4: Build and Start Service
 
 ```bash
@@ -304,11 +329,31 @@ COMPUTE_TYPE=int8
 ```
 
 #### For CPU-Only (Not Recommended)
+
+The `BATCH_SIZE` default is now device-aware: 16 on cuda, 2 on cpu. For CPU
+runs longer than ~15 minutes drop it to 1 to avoid OOM kills (exit 137).
+
 ```bash
 DEVICE=cpu
 COMPUTE_TYPE=int8
-BATCH_SIZE=4
+BATCH_SIZE=2          # default on cpu; use 1 for >30 min audio, smaller models
+PRELOAD_MODEL=small   # tiny/base/small are realistic on cpu; large-v3 is not
 ```
+
+### Idle Model Eviction
+
+If you serve multiple Whisper models in rotation and want to reclaim VRAM
+between bursts, set `MODEL_KEEP_ALIVE_SECONDS` to the idle window after which
+a model should be unloaded:
+
+```bash
+MODEL_KEEP_ALIVE_SECONDS=3600          # unload models idle for 1 hour
+MODEL_EVICTION_INTERVAL_SECONDS=60     # sweep cadence (floor 30 seconds)
+```
+
+Default is `0`, which keeps the previous behaviour (models stay resident
+until the process exits). The next request that needs an evicted model
+reloads it transparently.
 
 ### Model Selection in Speakr
 
@@ -342,6 +387,17 @@ Expected response:
   "loaded_models": []
 }
 ```
+
+### Step 1c: Prometheus Metrics
+
+```bash
+curl http://localhost:9000/metrics | head -20
+```
+
+Expected: OpenMetrics text starting with `# HELP whisperx_...` lines, not
+JSON. Add a Prometheus scrape job for this endpoint to monitor request
+throughput, durations, audio sizes, and VRAM usage. See the README's
+"Prometheus Metrics" section for the full metric list.
 
 ### Step 2: Test Transcription
 
