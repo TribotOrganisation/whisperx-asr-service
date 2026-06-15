@@ -39,6 +39,7 @@ services:
       - NLTK_DATA=/.cache/nltk_data
       - PRELOAD_MODEL=${PRELOAD_MODEL:-}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-1000}
+      - API_KEY=${API_KEY:-}
       # Serve mode: simple (uvicorn) or ray (Ray Serve)
       - SERVE_MODE=${SERVE_MODE:-simple}
       # Pipeline strategy (ray mode): replicate (full pipeline per GPU) or split (stage per GPU)

@@ -38,6 +38,7 @@ services:
       - NLTK_DATA=/.cache/nltk_data
       - PRELOAD_MODEL=${PRELOAD_MODEL:-}
       - MAX_FILE_SIZE_MB=${MAX_FILE_SIZE_MB:-1000}
+      - API_KEY=${API_KEY:-}
       - SERVE_MODE=${SERVE_MODE:-simple}
       - PIPELINE_STRATEGY=${PIPELINE_STRATEGY:-replicate}
       - WHISPER_BATCH_SIZE=${WHISPER_BATCH_SIZE:-4}
