@@ -1,0 +1,16 @@
+name: Build and push (dev)
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/acr-publish-reusable.yml
+    secrets: inherit
+    with:
+      acr_name: tribotwhisperxdev
+      resource_group: TribotDevRG
+      container_app_name: whisperx-asr-dev
+      environment_label: dev

@@ -1,0 +1,16 @@
+name: Build and push (prod)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    uses: ./.github/workflows/acr-publish-reusable.yml
+    secrets: inherit
+    with:
+      acr_name: tribotwhisperxprod
+      resource_group: TribotMainRG
+      container_app_name: whisperx-asr-prod
+      environment_label: prod
