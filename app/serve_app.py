@@ -51,6 +51,7 @@ from app.serve_deployments import (
     AlignDeployment,
     DiarizeDeployment,
 )
+from app.auth import API_KEY, install_api_key_auth
 
 warnings.filterwarnings("ignore", message=".*degrees of freedom is <= 0.*")
 
@@ -102,6 +103,12 @@ fastapi_app = FastAPI(
     description="Automatic Speech Recognition API with Speaker Diarization using WhisperX",
     version=__version__,
 )
+install_api_key_auth(fastapi_app)
+
+if API_KEY:
+    logger.info("API key authentication enabled")
+else:
+    logger.warning("API key authentication disabled (set API_KEY to require a secret)")
 
 
 @serve.deployment(
