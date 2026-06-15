@@ -21,7 +21,6 @@ services:
 
     ports:
       - "9000:9000"
-      - "${RAY_DASHBOARD_PORT:-8265}:8265"
 
     shm_size: '8g'
 
@@ -32,7 +31,7 @@ services:
       - DEVICE=${DEVICE:-cuda}
       - COMPUTE_TYPE=${COMPUTE_TYPE:-float16}
       - BATCH_SIZE=${BATCH_SIZE:-16}
-      - HF_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN:-}
       - CACHE_DIR=${CACHE_DIR:-/.cache}
       - HF_HOME=${CACHE_DIR:-/.cache}
       - HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-}
@@ -67,7 +66,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 1200s
 
     # Logging configuration
     logging:

@@ -65,4 +65,5 @@ tmp/
 *.tmp
 
 # Test audio files
-testfiles/
+test-files/*
+test-files/

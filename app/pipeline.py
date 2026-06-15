@@ -1,8 +1,8 @@
 """
 Shared ASR pipeline stage functions.
 
-Extracts the 3-stage WhisperX pipeline (transcribe -> align -> diarize) into
-reusable functions consumed by both the legacy FastAPI endpoints and the
+Extracts the ASR pipeline (diarize -> transcribe per chunk, or transcribe -> align -> diarize)
+into reusable functions consumed by both the legacy FastAPI endpoints and the
 Ray Serve deployments.
 """
 
@@ -13,7 +13,7 @@ import time
 import logging
 import threading
 import warnings
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 # Suppress pyannote's torchcodec warning -- we decode audio via whisperx.load_audio (ffmpeg),
 # not pyannote's built-in decoder, so the missing torchcodec is irrelevant.
@@ -43,6 +43,8 @@ MODEL_KEEP_ALIVE_SECONDS = int(os.getenv("MODEL_KEEP_ALIVE_SECONDS", "0"))
 MODEL_EVICTION_INTERVAL_SECONDS = max(
     30, int(os.getenv("MODEL_EVICTION_INTERVAL_SECONDS", "60"))
 )
+SAMPLE_RATE = 16000
+MIN_DIARIZED_CHUNK_SECONDS = 0.05
 
 
 def get_canonical_models() -> list:
@@ -126,6 +128,212 @@ def clear_gpu_memory():
         gc.collect()
         torch.cuda.empty_cache()
         logger.debug("GPU memory cache cleared")
+
+
+def _extract_audio_slice(audio: np.ndarray, start: float, end: float) -> np.ndarray:
+    """Extract a time-bounded slice from a 16 kHz mono audio array."""
+    start_sample = max(0, int(start * SAMPLE_RATE))
+    end_sample = min(len(audio), int(end * SAMPLE_RATE))
+    if end_sample <= start_sample:
+        return np.array([], dtype=audio.dtype)
+    return audio[start_sample:end_sample]
+
+
+def _offset_segment_times(segments: List[dict], offset: float, speaker: str) -> List[dict]:
+    """Shift segment timestamps to absolute time and attach the speaker label."""
+    shifted_segments = []
+    for segment in segments:
+        shifted = dict(segment)
+        shifted["start"] = shifted.get("start", 0.0) + offset
+        shifted["end"] = shifted.get("end", 0.0) + offset
+        shifted["speaker"] = speaker
+        words = shifted.get("words")
+        if words:
+            shifted["words"] = [
+                {
+                    **word,
+                    "start": word.get("start", 0.0) + offset,
+                    "end": word.get("end", 0.0) + offset,
+                }
+                for word in words
+            ]
+        shifted_segments.append(shifted)
+    return shifted_segments
+
+
+def _run_diarization(
+    audio: np.ndarray,
+    num_speakers: Optional[int] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    return_speaker_embeddings: bool = False,
+) -> Tuple[Any, Optional[dict]]:
+    """Run pyannote diarization and return speaker segments."""
+    logger.info("Starting speaker diarization...")
+    diarize_model = load_diarize_pipeline()
+
+    diarize_params: Dict[str, Any] = {}
+    if num_speakers is not None:
+        diarize_params["num_speakers"] = num_speakers
+        logger.info(f"Diarization with exact speaker count: {num_speakers}")
+    else:
+        if min_speakers is not None:
+            diarize_params["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            diarize_params["max_speakers"] = max_speakers
+        logger.info(f"Diarization with speaker range: {min_speakers}-{max_speakers}")
+
+    if return_speaker_embeddings:
+        diarize_params["return_embeddings"] = True
+        logger.info("Speaker embeddings will be returned")
+
+    diarize_output = diarize_model(audio, **diarize_params)
+
+    speaker_embeddings = None
+    if return_speaker_embeddings and isinstance(diarize_output, tuple):
+        diarize_segments, speaker_embeddings = diarize_output
+        logger.info(f"Received speaker embeddings for {len(speaker_embeddings)} speakers")
+    else:
+        diarize_segments = diarize_output
+
+    if hasattr(diarize_segments, "exclusive_speaker_diarization"):
+        diarize_segments = diarize_segments.exclusive_speaker_diarization
+        logger.info("Using exclusive speaker diarization for better timestamp reconciliation")
+
+    clear_gpu_memory()
+    return diarize_segments, speaker_embeddings
+
+
+def _transcribe_diarized_chunks(
+    audio: np.ndarray,
+    diarize_df: Any,
+    model_name: str = DEFAULT_MODEL,
+    task: str = "transcribe",
+    word_timestamps: bool = True,
+) -> dict:
+    """
+    Transcribe each diarization segment separately with language auto-detection.
+
+    Diarization runs first; each speaker chunk is sent to Whisper independently
+    so different speakers can be transcribed in different languages.
+    """
+    if diarize_df is None or len(diarize_df) == 0:
+        return {"segments": [], "language": "en", "word_segments": []}
+
+    all_segments: List[dict] = []
+    all_word_segments: List[dict] = []
+    detected_languages: List[str] = []
+
+    diarize_rows = diarize_df.sort_values("start")
+    logger.info(f"Transcribing {len(diarize_rows)} diarized speaker chunks...")
+
+    for chunk_index, (_, row) in enumerate(diarize_rows.iterrows(), start=1):
+        chunk_start = float(row["start"])
+        chunk_end = float(row["end"])
+        speaker = row["speaker"]
+        chunk_audio = _extract_audio_slice(audio, chunk_start, chunk_end)
+        chunk_duration = len(chunk_audio) / SAMPLE_RATE
+
+        if chunk_duration < MIN_DIARIZED_CHUNK_SECONDS:
+            logger.debug(
+                f"Skipping diarized chunk {chunk_index} ({speaker}, "
+                f"{chunk_duration:.3f}s): too short"
+            )
+            continue
+
+        logger.info(
+            f"Transcribing diarized chunk {chunk_index}/{len(diarize_rows)} "
+            f"({speaker}, {chunk_start:.2f}s-{chunk_end:.2f}s)"
+        )
+
+        chunk_result = transcribe(
+            chunk_audio,
+            model_name=model_name,
+            language=None,
+            task=task,
+            initial_prompt=None,
+            hotwords=None,
+        )
+
+        chunk_language = chunk_result.get("language")
+        if chunk_language:
+            detected_languages.append(chunk_language)
+
+        chunk_segments = chunk_result.get("segments", [])
+        if not chunk_segments and chunk_result.get("text"):
+            chunk_segments = [{
+                "start": 0.0,
+                "end": chunk_duration,
+                "text": chunk_result["text"],
+            }]
+
+        if word_timestamps and chunk_segments:
+            chunk_result = align(chunk_audio, {"segments": chunk_segments, "language": chunk_language})
+            chunk_segments = chunk_result.get("segments", chunk_segments)
+            chunk_word_segments = chunk_result.get("word_segments", [])
+            for word_segment in chunk_word_segments:
+                word_segment = dict(word_segment)
+                word_segment["start"] = word_segment.get("start", 0.0) + chunk_start
+                word_segment["end"] = word_segment.get("end", 0.0) + chunk_start
+                word_segment["speaker"] = speaker
+                if chunk_language:
+                    word_segment["language"] = chunk_language
+                all_word_segments.append(word_segment)
+
+        for segment in _offset_segment_times(chunk_segments, chunk_start, speaker):
+            if chunk_language:
+                segment["language"] = chunk_language
+            all_segments.append(segment)
+
+    all_segments.sort(key=lambda segment: segment.get("start", 0.0))
+    all_word_segments.sort(key=lambda segment: segment.get("start", 0.0))
+
+    unique_languages = list(dict.fromkeys(detected_languages))
+    if len(unique_languages) == 1:
+        language = unique_languages[0]
+    elif len(unique_languages) > 1:
+        language = "multilingual"
+    else:
+        language = "en"
+
+    logger.info(
+        f"Diarize-first transcription complete: {len(all_segments)} segments, "
+        f"language={language}"
+    )
+    return {
+        "segments": all_segments,
+        "language": language,
+        "word_segments": all_word_segments,
+    }
+
+
+def _run_diarize_first_pipeline(
+    audio: np.ndarray,
+    model_name: str = DEFAULT_MODEL,
+    task: str = "transcribe",
+    word_timestamps: bool = True,
+    num_speakers: Optional[int] = None,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    return_speaker_embeddings: bool = False,
+) -> Tuple[dict, Optional[dict]]:
+    """Run diarization first, then transcribe each speaker chunk separately."""
+    logger.info("Starting diarize-first pipeline...")
+    diarize_df, speaker_embeddings = _run_diarization(
+        audio,
+        num_speakers=num_speakers,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        return_speaker_embeddings=return_speaker_embeddings,
+    )
+    result = _transcribe_diarized_chunks(
+        audio,
+        diarize_df,
+        model_name=model_name,
+        task=task,
+        word_timestamps=word_timestamps,
+    )
+    return result, speaker_embeddings
 
 
 # ---------------------------------------------------------------------------
@@ -328,38 +536,16 @@ def diarize(
     logger.info("Starting speaker diarization...")
     speaker_embeddings = None
     try:
-        diarize_model = load_diarize_pipeline()
-
-        diarize_params: Dict[str, Any] = {}
-        if num_speakers is not None:
-            diarize_params["num_speakers"] = num_speakers
-            logger.info(f"Diarization with exact speaker count: {num_speakers}")
-        else:
-            if min_speakers is not None:
-                diarize_params["min_speakers"] = min_speakers
-            if max_speakers is not None:
-                diarize_params["max_speakers"] = max_speakers
-            logger.info(f"Diarization with speaker range: {min_speakers}-{max_speakers}")
-
-        if return_speaker_embeddings:
-            diarize_params["return_embeddings"] = True
-            logger.info("Speaker embeddings will be returned")
-
-        diarize_output = diarize_model(audio, **diarize_params)
-
-        if return_speaker_embeddings and isinstance(diarize_output, tuple):
-            diarize_segments, speaker_embeddings = diarize_output
-            logger.info(f"Received speaker embeddings for {len(speaker_embeddings)} speakers")
-        else:
-            diarize_segments = diarize_output
-
-        if hasattr(diarize_segments, "exclusive_speaker_diarization"):
-            diarize_segments = diarize_segments.exclusive_speaker_diarization
-            logger.info("Using exclusive speaker diarization for better timestamp reconciliation")
+        diarize_segments, speaker_embeddings = _run_diarization(
+            audio,
+            num_speakers=num_speakers,
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            return_speaker_embeddings=return_speaker_embeddings,
+        )
 
         result = whisperx.assign_word_speakers(diarize_segments, result)
         logger.info("Speaker diarization complete")
-        clear_gpu_memory()
     except Exception as e:
         logger.warning(f"Speaker diarization failed: {e}, continuing without diarization")
 
@@ -416,10 +602,35 @@ def run_pipeline(
     return_speaker_embeddings: bool = False,
 ) -> Tuple[dict, Optional[dict]]:
     """
-    Run the full 3-stage pipeline: transcribe -> align -> diarize.
+    Run the ASR pipeline.
 
-    Returns (result, speaker_embeddings_or_None).
+    When diarization is enabled, pyannote runs first and each speaker chunk is
+    transcribed separately with language auto-detection. Otherwise the pipeline
+    transcribes the full audio, optionally aligns, then optionally diarizes.
     """
+    speaker_embeddings = None
+    if should_diarize:
+        if not HF_TOKEN:
+            logger.warning("Speaker diarization requested but HF_TOKEN not set")
+        else:
+            if initial_prompt is not None or hotwords is not None:
+                logger.info("initial_prompt and hotwords are ignored in diarize-first mode")
+            try:
+                return _run_diarize_first_pipeline(
+                    audio,
+                    model_name=model_name,
+                    task=task,
+                    word_timestamps=word_timestamps,
+                    num_speakers=num_speakers,
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                    return_speaker_embeddings=return_speaker_embeddings,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Diarize-first pipeline failed: {e}, falling back to transcribe-first"
+                )
+
     result = transcribe(
         audio,
         model_name=model_name,
@@ -432,7 +643,6 @@ def run_pipeline(
     if word_timestamps:
         result = align(audio, result)
 
-    speaker_embeddings = None
     if should_diarize:
         result, speaker_embeddings = diarize(
             audio,

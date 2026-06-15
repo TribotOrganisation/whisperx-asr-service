@@ -36,5 +36,6 @@ serve.run(app, blocking=True)
 "
 else
     echo "Starting in simple mode (uvicorn)..."
+    echo "Models will download/load before the API accepts requests (see startup logs)..."
     exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port 9000
 fi

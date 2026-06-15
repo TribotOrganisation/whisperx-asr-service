@@ -5,6 +5,7 @@ Compatible with openai-whisper-asr-webservice API endpoints
 
 import os
 import time
+import asyncio
 import tempfile
 import logging
 import warnings
@@ -20,9 +21,7 @@ from app.pipeline import (
     DEVICE,
     COMPUTE_TYPE,
     BATCH_SIZE,
-    HF_TOKEN,
     DEFAULT_MODEL,
-    load_whisper_model,
     clear_gpu_memory,
     format_timestamp,
     sanitize_float_values,
@@ -30,6 +29,7 @@ from app.pipeline import (
     resolve_model_name,
     _whisper_models as loaded_models,
 )
+from app.preload import preload_models
 from app.queue import run_in_queue, get_queue_metrics
 from app import metrics as prom_metrics
 
@@ -60,21 +60,16 @@ logger.info(f"Default model: {DEFAULT_MODEL}, Serve mode: {SERVE_MODE}")
 
 @app.on_event("startup")
 async def startup_event():
-    """Preload models on startup"""
+    """Download and load models before accepting requests."""
     prom_metrics.SERVICE_INFO.info({
         "version": __version__,
         "device": DEVICE,
         "compute_type": COMPUTE_TYPE,
         "serve_mode": SERVE_MODE,
     })
-    preload_model = os.getenv("PRELOAD_MODEL", None)
-    if preload_model:
-        logger.info(f"Preloading model on startup: {preload_model}")
-        try:
-            load_whisper_model(preload_model)
-            logger.info(f"Successfully preloaded model: {preload_model}")
-        except Exception as e:
-            logger.error(f"Failed to preload model {preload_model}: {str(e)}")
+    logger.info("Preloading models before API startup (downloads on first run)...")
+    await asyncio.to_thread(preload_models)
+    logger.info("Model preload complete, API ready")
 
 
 @app.get("/")

@@ -1,0 +1,37 @@
+services:
+  whisperx-asr:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+
+    volumes:
+      - ..:/workspace:cached
+      - whisperx-dev-cache:/.cache
+
+    shm_size: 8g
+
+    env_file:
+      - path: ../.env
+        required: false
+
+    environment:
+      - PYTHONWARNINGS=ignore::UserWarning
+      - CACHE_DIR=/.cache
+      - HF_HOME=/.cache
+      - NLTK_DATA=/.cache/nltk_data
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ports:
+      - "9000:9000"
+
+    command: bash -c "python3 -m uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload"
+
+volumes:
+  whisperx-dev-cache:
