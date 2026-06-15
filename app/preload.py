@@ -2,7 +2,7 @@
 Download and load ML models before the API accepts traffic.
 
 Run directly: python3 -m app.preload
-Called from entrypoint.sh before uvicorn / Ray Serve starts.
+Called from FastAPI startup (and Ray Serve deployments).
 """
 
 import os
@@ -15,10 +15,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+PRELOAD_ALIGN_LANGUAGES = ("en", "ar")
+
+
+def preload_align_models() -> None:
+    """Download alignment (wav2vec2) models for configured languages."""
+    from app.pipeline import load_align_model, clear_gpu_memory
+
+    for language_code in PRELOAD_ALIGN_LANGUAGES:
+        try:
+            logger.info(f"Preloading alignment model for: {language_code}")
+            load_align_model(language_code)
+            logger.info(f"Alignment model ready: {language_code}")
+        except Exception as exc:
+            logger.warning(
+                f"Could not preload alignment model for {language_code}: {exc}"
+            )
+
+    clear_gpu_memory()
+
 
 def preload_models() -> None:
-    """Load Whisper and diarization models into memory (downloads on first run)."""
-    from app.pipeline import HF_TOKEN, load_whisper_model, load_diarize_pipeline
+    """Load Whisper, diarization, and alignment models."""
+    from app.pipeline import HF_TOKEN, load_whisper_model, load_diarize_pipeline, clear_gpu_memory
 
     preload_disabled = os.getenv("PRELOAD_ON_STARTUP", "true").lower() in ("0", "false", "no")
     if preload_disabled:
@@ -40,6 +59,9 @@ def preload_models() -> None:
         else:
             logger.info("Skipping diarization preload (HF_TOKEN not set)")
 
+    preload_align_models()
+
+    clear_gpu_memory()
     logger.info("All configured models preloaded successfully")
 
 
