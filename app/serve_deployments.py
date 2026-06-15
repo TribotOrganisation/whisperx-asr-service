@@ -112,11 +112,11 @@ class FullPipelineDeployment:
 
         preload = os.getenv("PRELOAD_MODEL", None)
         if preload:
-            logger.info(f"FullPipelineDeployment: preloading model {preload}")
-            load_whisper_model(preload)
-        if HF_TOKEN:
-            logger.info("FullPipelineDeployment: preloading diarization pipeline")
-            load_diarize_pipeline()
+            logger.info(f"FullPipelineDeployment: running full model preload")
+            from app.preload import preload_models
+            preload_models()
+        else:
+            logger.info("FullPipelineDeployment: PRELOAD_MODEL not set, skipping preload")
 
         self._ready = True
         logger.info("FullPipelineDeployment: initialisation complete, ready to serve")
